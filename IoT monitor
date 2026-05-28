@@ -1,0 +1,754 @@
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+import random, math, time, csv, json, threading
+from datetime import datetime
+from collections import deque
+
+import matplotlib
+matplotlib.use("TkAgg")
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
+import numpy as np
+
+# Спеціально підібрана палітра кольорів
+LIGHT = dict(
+    bg="#f0f2f5", surface="#ffffff", surface2="#e4e6eb", surface3="#d8dadf",
+    text="#050505", text2="#65676b", text3="#bcc0c4",
+    border="#ced0d4",
+    ok="#244b02", ok_bg="#e1f5fe",
+    warn="#854f0b", warn_bg="#fef3c7",
+    err="#a32d2d", err_bg="#fee2e2",
+    info="#1877f2", info_bg="#e7f3ff",
+    chart_bg="#ffffff",
+)
+DARK = dict(
+    bg="#18191a", surface="#242526", surface2="#3a3b3c", surface3="#4e4f50",
+    text="#e4e6eb", text2="#b0b3b8", text3="#3a3b3c",
+    border="#3e4042",
+    ok="#4ade80", ok_bg="#14532d",
+    warn="#f59e0b", warn_bg="#78350f",
+    err="#f87171", err_bg="#7f1d1d",
+    info="#4599ff", info_bg="#0c2340",
+    chart_bg="#242526",
+)
+
+SENSOR_COLORS = ["#d85a30","#378add","#639922","#7f77dd",
+                 "#ef9f27","#d4537e","#1d9e75","#993c1d"]
+
+SENSORS_DEF = [
+    dict(name="Температура",  location="Сервер A",  room="Серверна",
+         unit="°C",  min_v=18, max_v=85, warn=70, err=80, normal=(20,45)),
+    dict(name="Вологість",    location="Склад B",   room="Склад",
+         unit="%",   min_v=20, max_v=95, warn=80, err=90, normal=(30,70)),
+    dict(name="CO₂",          location="Офіс C",    room="Офіс",
+         unit="ppm", min_v=350,max_v=2000,warn=1000,err=1500,normal=(350,800)),
+    dict(name="Тиск",         location="Цех D",     room="Цех",
+         unit="hPa", min_v=960,max_v=1040,warn=1025,err=1030,normal=(990,1020)),
+    dict(name="Освітленість", location="Офіс C",    room="Офіс",
+         unit="lx",  min_v=0,  max_v=1000,warn=800, err=950, normal=(100,600)),
+    dict(name="Рух",          location="Коридор E", room="Коридор",
+         unit="",    min_v=0,  max_v=1,   warn=1,   err=1,   normal=(0,0)),
+    dict(name="Вібрація",     location="Цех D",     room="Цех",
+         unit="g",   min_v=0,  max_v=10,  warn=5,   err=8,   normal=(0,2)),
+    dict(name="Задимленість", location="Склад B",   room="Склад",
+         unit="%",   min_v=0,  max_v=100, warn=15,  err=30,  normal=(0,5)),
+]
+
+USERS = {
+    "admin":    dict(password="admin123", role="admin",    label="Адміністратор"),
+    "operator": dict(password="oper456",  role="operator", label="Оператор"),
+    "viewer":   dict(password="view789",  role="viewer",   label="Переглядач"),
+}
+
+MAX_LOG = 500
+HISTORY_LEN = 60   
+
+def rnd(a, b): return round(random.uniform(a, b), 2)
+def gen_series(s, n=24):
+    v = rnd(*s["normal"])
+    out = []
+    for _ in range(n):
+        if s["unit"] == "":
+            out.append(1.0 if random.random() < 0.05 else 0.0)
+        else:
+            v += (random.random() - 0.48) * (s["max_v"] - s["min_v"]) * 0.04
+            v = max(s["min_v"], min(s["max_v"], v))
+            out.append(round(v, 2))
+    return out
+
+def sensor_status(val, s):
+    if s["unit"] == "":
+        return "Спрацював" if val >= 1 else "Норма"
+    if val >= s["err"]:  return "Критично"
+    if val >= s["warn"]: return "Увага"
+    return "Normal" if "normal" in s else "Норма" # Для сумісності, але краще за замовчуванням "Норма"
+
+def status_color(val, s, theme):
+    st = sensor_status(val, s)
+    if st == "Критично":           return theme["err"]
+    if st in ("Увага","Спрацював"): return theme["warn"]
+    return theme["ok"]
+
+class IoTApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("IoT Monitor Ultimate")
+        self.root.geometry("1200x800")
+        self.root.minsize(950, 650)
+
+        self.dark_mode = False
+        self.theme = LIGHT
+        
+        self.style = ttk.Style()
+        self.style.theme_use("clam")
+
+        self.current_user = None
+        self.session_start = None
+
+        self.sensors = []
+        for i, s in enumerate(SENSORS_DEF):
+            d = dict(**s)
+            d["color"] = SENSOR_COLORS[i]
+            d["current"] = rnd(*s["normal"])
+            d["prev"]    = d["current"]
+            d["series"]  = gen_series(s, 24)
+            d["history"] = deque([d["current"]] * HISTORY_LEN, maxlen=HISTORY_LEN)
+            self.sensors.append(d)
+
+        self.data_log = []
+        self.access_log = []
+        self.rules = []
+        self.rule_log = []
+
+        self._update_ttk_styles()
+        self._build_login()
+
+    def _update_ttk_styles(self):
+        t = self.theme
+        self.root.config(bg=t["bg"])
+        
+        self.style.configure(".", background=t["bg"], foreground=t["text"])
+        self.style.configure("TFrame", background=t["bg"])
+        self.style.configure("Card.TFrame", background=t["surface"], relief="flat", borderwidth=0)
+        self.style.configure("Nav.TFrame", background=t["surface2"])
+        
+        self.style.configure("TLabel", background=t["bg"], foreground=t["text"], font=("Courier New", 10))
+        self.style.configure("Title.TLabel", font=("Courier New", 16, "bold"))
+        self.style.configure("Header.TLabel", font=("Courier New", 13, "bold"), background=t["bg"])
+        self.style.configure("CardTitle.TLabel", background=t["surface"], foreground=t["text2"], font=("Courier New", 9, "bold"))
+        self.style.configure("CardValue.TLabel", background=t["surface"], foreground=t["text"], font=("Georgia", 18, "bold"))
+        self.style.configure("CardSub.TLabel", background=t["surface"], foreground=t["text3"], font=("Courier New", 8))
+        
+        self.style.configure("TButton", font=("Courier New", 9, "bold"), background=t["surface2"], foreground=t["text"], borderwidth=1, focuscolor="")
+        self.style.map("TButton", background=[("active", t["surface3"])])
+        
+        self.style.configure("Nav.TButton", font=("Courier New", 10), background=t["surface2"], borderwidth=0)
+        self.style.map("Nav.TButton", background=[("active", t["surface3"])])
+
+        self.style.configure("TLabelframe", background=t["bg"], foreground=t["text2"], font=("Courier New", 10, "bold"))
+        self.style.configure("TLabelframe.Label", background=t["bg"], foreground=t["text2"])
+
+        self.style.configure("TCombobox", fieldbackground=t["surface"], background=t["surface2"], foreground=t["text"])
+        
+        self.style.configure("Treeview", background=t["surface"], fieldbackground=t["surface"], foreground=t["text"], rowheight=24, font=("Courier New", 9))
+        self.style.configure("Treeview.Heading", background=t["surface2"], foreground=t["text2"], font=("Courier New", 9, "bold"), borderwidth=1)
+        self.style.map("Treeview", background=[("selected", t["info_bg"])], foreground=[("selected", t["text"] if self.dark_mode else "#ffffff")])
+
+    def _build_login(self):
+        self.login_frame = ttk.Frame(self.root)
+        self.login_frame.pack(fill="both", expand=True)
+
+        box = ttk.Frame(self.login_frame, padding=20, style="Card.TFrame")
+        box.place(relx=0.5, rely=0.5, anchor="center")
+
+        ttk.Label(box, text="IoT Monitor Control", style="Title.TLabel").pack(pady=(0,4))
+        ttk.Label(box, text="Введіть облікові дані", style="CardTitle.TLabel").pack(pady=(0,16))
+
+        f1 = ttk.Frame(box, style="Card.TFrame"); f1.pack(fill="x", pady=4)
+        ttk.Label(f1, text="Логін", style="CardTitle.TLabel").pack(anchor="w")
+        self._login_user = ttk.Entry(f1, font=("Georgia", 12))
+        self._login_user.pack(fill="x", ipady=2, pady=2)
+
+        f2 = ttk.Frame(box, style="Card.TFrame"); f2.pack(fill="x", pady=4)
+        ttk.Label(f2, text="Пароль", style="CardTitle.TLabel").pack(anchor="w")
+        self._login_pass = ttk.Entry(f2, show="•", font=("Georgia", 12))
+        self._login_pass.pack(fill="x", ipady=2, pady=2)
+
+        self._login_err = tk.Label(box, text="", font=("Courier New", 10), fg="#A32D2D", bg=self.theme["surface"])
+        self._login_err.pack(pady=2)
+
+        ttk.Button(box, text="УВІЙТИ", command=self._do_login).pack(fill="x", pady=8, ipady=4)
+
+        hint = "Підказка для тестів:\nadmin / admin123\noperator / oper456\nviewer / view789"
+        tk.Label(box, text=hint, font=("Courier New", 8), justify="left", fg=self.theme["text2"], bg=self.theme["surface"]).pack(pady=(10,0))
+
+        self._login_pass.bind("<Return>", lambda e: self._do_login())
+
+    def _do_login(self):
+        u = self._login_user.get().strip()
+        p = self._login_pass.get()
+        if u in USERS and USERS[u]["password"] == p:
+            self.current_user = dict(username=u, **USERS[u])
+            self.session_start = datetime.now()
+            self._add_access_log("Вхід", "Успішна автентифікація")
+            self.login_frame.destroy()
+            self._build_main()
+            self._start_live_update()
+        else:
+            self._login_err.config(text="Невірний логін або пароль")
+            self._add_access_log("Невдала спроба", f"Користувач: {u}", failed=True)
+
+    def _do_logout(self):
+        self._add_access_log("Вихід", "Сесія завершена")
+        self.current_user = None
+        if hasattr(self, "_live_job"):
+            self.root.after_cancel(self._live_job)
+        if hasattr(self, "_clock_job"):
+            self.root.after_cancel(self._clock_job)
+        self.main_frame.destroy()
+        self._build_login()
+
+    def _build_main(self):
+        self.main_frame = ttk.Frame(self.root)
+        self.main_frame.pack(fill="both", expand=True)
+
+        self._build_nav()
+
+        self.content = ttk.Frame(self.main_frame)
+        self.content.pack(fill="both", expand=True, padx=10, pady=10)
+
+        self.pages = {}
+        self._build_dashboard()
+        self._build_compare()
+        self._build_forecast()
+        self._build_automation()
+        self._build_thresholds()
+        self._build_export()
+        self._build_access_log()
+
+        self._show_page("dashboard")
+
+    def _build_nav(self):
+        nav = ttk.Frame(self.main_frame, height=45, style="Nav.TFrame")
+        nav.pack(fill="x")
+        nav.pack_propagate(False)
+        self.nav_frame = nav
+
+        self._nav_btns = {}
+        tabs = [
+            ("dashboard",   " Дашборд",      True),
+            ("compare",     " Порівняння",    True),
+            ("forecast",    " Прогноз",       True),
+            ("automation",  " Автоматизація", self.current_user["role"] == "admin"),
+            ("thresholds",  " Пороги",        self.current_user["role"] == "admin"),
+            ("export",      " Експорт",       True),
+            ("access_log",  " Журнал",        self.current_user["role"] == "admin"),
+        ]
+        for key, label, visible in tabs:
+            if not visible: continue
+            b = ttk.Button(nav, text=label, command=lambda k=key: self._show_page(k))
+            b.pack(side="left", fill="y", padx=2)
+            self._nav_btns[key] = b
+
+        right = ttk.Frame(nav, style="Nav.TFrame")
+        right.pack(side="right", fill="y", padx=5)
+
+        role_lbl = ttk.Label(right, text=f" {self.current_user['label']}", font=("Courier New", 9, "bold"), background=self.theme["surface2"])
+        role_lbl.pack(side="left", padx=10)
+
+        self._clock_lbl = ttk.Label(right, text="", font=("Courier New", 9), background=self.theme["surface2"])
+        self._clock_lbl.pack(side="left", padx=10)
+
+        ttk.Button(right, text=" Тема", command=self._toggle_theme).pack(side="left", padx=2, fill="y", pady=4)
+        ttk.Button(right, text="Вийти", command=self._do_logout).pack(side="left", padx=2, fill="y", pady=4)
+
+    def _show_page(self, name):
+        for k, f in self.pages.items():
+            f.pack_forget()
+        self.pages[name].pack(fill="both", expand=True)
+        self.current_page = name
+        
+        if name == "dashboard":  self._render_dashboard()
+        if name == "compare":    self._render_compare()
+        if name == "forecast":   self._render_forecast()
+        if name == "export":     self._render_export()
+        if name == "access_log": self._render_access_log()
+
+    def _build_dashboard(self):
+        frame = ttk.Frame(self.content)
+        self.pages["dashboard"] = frame
+
+        top = ttk.Frame(frame)
+        top.pack(fill="x", pady=8)
+        ttk.Label(top, text="IoT — Моніторинг систем в реальному часі", style="Header.TLabel").pack(side="left")
+        
+        self._live_lbl = tk.Label(top, text="● Живий режим", font=("Courier New", 9, "bold"), fg=self.theme["ok"], bg=self.theme["bg"])
+        self._live_lbl.pack(side="left", padx=15)
+        
+        ttk.Button(top, text="⟳ Оновити дані", command=self._refresh).pack(side="right")
+
+        self._metrics_frame = ttk.Frame(frame)
+        self._metrics_frame.pack(fill="x", pady=4)
+
+        ctrl = ttk.Frame(frame)
+        ctrl.pack(fill="x", pady=6)
+        ttk.Label(ctrl, text="Оберіть датчик для детального графіка: ").pack(side="left")
+        self._sensor_var = tk.StringVar()
+        names = [s["name"] for s in self.sensors]
+        self._sensor_cb = ttk.Combobox(ctrl, textvariable=self._sensor_var, values=names, width=18, state="readonly")
+        self._sensor_cb.current(0)
+        self._sensor_cb.pack(side="left", padx=4)
+        self._sensor_cb.bind("<<ComboboxSelected>>", lambda e: self._render_dashboard())
+
+        fig_frame = ttk.LabelFrame(frame, text=" Історія показників ")
+        fig_frame.pack(fill="both", expand=True, pady=4)
+        
+        self._main_fig = Figure(figsize=(8, 2.8), dpi=95)
+        self._main_ax  = self._main_fig.add_subplot(111)
+        self._main_canvas = FigureCanvasTkAgg(self._main_fig, fig_frame)
+        self._main_canvas.get_tk_widget().pack(fill="both", expand=True, padx=5, pady=5)
+
+        bot = ttk.Frame(frame)
+        bot.pack(fill="x", pady=6)
+
+        self._sensor_list_frame = ttk.LabelFrame(bot, text=" Поточний статус ")
+        self._sensor_list_frame.pack(side="left", fill="both", expand=True, padx=(0,6))
+
+        self._alerts_frame = ttk.LabelFrame(bot, text=" Активні сповіщення системи ")
+        self._alerts_frame.pack(side="left", fill="both", expand=True)
+
+    def _render_dashboard(self):
+        t = self.theme
+        for w in self._metrics_frame.winfo_children():
+            w.destroy()
+        
+        self.root.update_idletasks()
+        w_width = self._metrics_frame.winfo_width()
+        if w_width < 200: w_width = 1150
+        cols = max(1, w_width // 145)
+
+        for i, s in enumerate(self.sensors):
+            card = ttk.Frame(self._metrics_frame, style="Card.TFrame", padding=8)
+            card.grid(row=i//cols, column=i%cols, padx=4, pady=4, sticky="nsew")
+            
+            st = sensor_status(s["current"], s)
+            stc = status_color(s["current"], s, t)
+            val_str = ("ON" if s["current"] >= 1 else "OFF") if s["unit"] == "" else f"{s['current']}"
+            
+            ttk.Label(card, text=s["name"], style="CardTitle.TLabel").pack(anchor="w")
+            ttk.Label(card, text=s["location"], style="CardSub.TLabel").pack(anchor="w")
+            ttk.Label(card, text=f"{val_str} {s['unit']}", style="CardValue.TLabel").pack(anchor="w", pady=2)
+            
+            delta = round(s["current"] - s["prev"], 2)
+            sign = "▲" if delta > 0 else ("▼" if delta < 0 else "—")
+            dcol = t["err"] if (delta > 0 and s["unit"] != "") else t["ok"]
+            
+            lbl_delta = tk.Label(card, text=f"{sign} {abs(delta)}", font=("Courier New", 8, "bold"), fg=dcol, bg=t["surface"])
+            lbl_delta.pack(anchor="w")
+            
+            lbl_st = tk.Label(card, text=st.upper(), font=("Courier New", 8, "bold"), fg=stc, bg=t["surface"])
+            lbl_st.pack(anchor="w", pady=(2,0))
+
+        sel = self._sensor_var.get() or self.sensors[0]["name"]
+        s = next((x for x in self.sensors if x["name"] == sel), self.sensors[0])
+        ax = self._main_ax
+        ax.clear()
+        
+        ax.plot(list(s["history"]), color=s["color"], linewidth=2, marker="o", markersize=3)
+        if s["unit"] != "":
+            ax.axhline(s["warn"], color=t["warn"], linestyle="--", linewidth=1, alpha=0.8, label="Увага")
+            ax.axhline(s["err"],  color=t["err"],  linestyle="--", linewidth=1, alpha=0.8, label="Критично")
+            ax.legend(fontsize=8, facecolor=t["chart_bg"], labelcolor=t["text2"], loc="upper left")
+            
+        ax.set_facecolor(t["chart_bg"])
+        self._main_fig.patch.set_facecolor(t["chart_bg"])
+        ax.tick_params(colors=t["text2"], labelsize=8)
+        for spine in ax.spines.values(): spine.set_edgecolor(t["border"])
+        ax.set_title(f"Аналіз змін: {s['name']} ({s['unit']})", color=t["text"], fontsize=10, fontfamily="monospace", weight="bold")
+        self._main_canvas.draw()
+
+        for w in self._sensor_list_frame.winfo_children(): w.destroy()
+        for s in self.sensors:
+            row = ttk.Frame(self._sensor_list_frame, style="Card.TFrame")
+            row.pack(fill="x", pady=2, padx=4)
+            
+            val_str = ("ON" if s["current"] >= 1 else "OFF") if s["unit"] == "" else f"{s['current']} {s['unit']}"
+            
+            tk.Label(row, text=f"■ {s['name']}", font=("Courier New", 9, "bold"), fg=s["color"], bg=t["surface"]).pack(side="left", padx=4)
+            ttk.Label(row, text=s["location"], style="CardSub.TLabel").pack(side="left", padx=10)
+            ttk.Label(row, text=val_str, font=("Courier New", 9, "bold"), background=t["surface"]).pack(side="right", padx=10)
+
+        for w in self._alerts_frame.winfo_children(): w.destroy()
+        any_alert = False
+        for s in self.sensors:
+            st = sensor_status(s["current"], s)
+            if st in ("Критично", "Увага", "Спрацював"):
+                any_alert = True
+                stc = status_color(s["current"], s, t)
+                bg_alert = t["err_bg"] if st == "Критично" else t["warn_bg"]
+                val_str = ("ON" if s["current"] >= 1 else "OFF") if s["unit"] == "" else f"{s['current']} {s['unit']}"
+                
+                f_alert = tk.Frame(self._alerts_frame, bg=bg_alert, relief="flat", bd=0)
+                f_alert.pack(fill="x", padx=5, pady=2)
+                
+                icon = "" if st == "Критично" else ""
+                tk.Label(f_alert, text=f"{icon} {s['name'].upper()} у [{s['room']}]: {val_str} — {st.upper()}",
+                         font=("Courier New", 9, "bold"), fg=stc, bg=bg_alert, anchor="w").pack(fill="x", padx=5, pady=4)
+        if not any_alert:
+            f_ok = tk.Frame(self._alerts_frame, bg=t["ok_bg"])
+            f_ok.pack(fill="x", padx=5, pady=5)
+            tk.Label(f_ok, text="✓ СИСТЕМА ПРАЦЮЄ В ШТАТНОМУ РЕЖИМІ. ПОМИЛОК НЕМАЄ", font=("Courier New", 9, "bold"), fg=t["ok"], bg=t["ok_bg"]).pack(pady=6)
+
+    def _build_compare(self):
+        frame = ttk.Frame(self.content)
+        self.pages["compare"] = frame
+
+        ttk.Label(frame, text="Порівняльний аналіз роботи датчиків", style="Header.TLabel").pack(pady=8, anchor="w")
+
+        self._cmp_fig = Figure(figsize=(8, 3.8), dpi=95)
+        self._cmp_ax  = self._cmp_fig.add_subplot(111)
+        canvas = FigureCanvasTkAgg(self._cmp_fig, frame)
+        canvas.get_tk_widget().pack(fill="both", expand=True, pady=4)
+        self._cmp_canvas = canvas
+
+        self._room_frame = ttk.LabelFrame(frame, text=" Агреговані дані по локаціях ")
+        self._room_frame.pack(fill="x", pady=6)
+
+    def _render_compare(self):
+        t = self.theme
+        ax = self._cmp_ax
+        ax.clear()
+        hours = list(range(24))
+        for s in self.sensors:
+            if s["unit"] == "": continue
+            ax.plot(hours, s["series"], color=s["color"], linewidth=1.5, label=s["name"], alpha=0.8)
+            
+        ax.set_facecolor(t["chart_bg"])
+        self._cmp_fig.patch.set_facecolor(t["chart_bg"])
+        ax.tick_params(colors=t["text2"], labelsize=8)
+        for sp in ax.spines.values(): sp.set_edgecolor(t["border"])
+        ax.legend(fontsize=8, facecolor=t["chart_bg"], labelcolor=t["text2"])
+        ax.set_title("Добова нормалізована динаміка", color=t["text"], fontfamily="monospace", weight="bold")
+        self._cmp_canvas.draw()
+
+        for w in self._room_frame.winfo_children(): w.destroy()
+        rooms = {}
+        for s in self.sensors:
+            if s["unit"] == "": continue
+            rooms.setdefault(s["room"], []).append(s["current"])
+            
+        for room, vals in rooms.items():
+            avg = round(sum(vals)/len(vals), 1)
+            row = ttk.Frame(self._room_frame, style="Card.TFrame", padding=4)
+            row.pack(fill="x", pady=2, padx=5)
+            ttk.Label(row, text=f" {room}:", width=20, style="CardTitle.TLabel").pack(side="left")
+            ttk.Label(row, text=f"Середній показник середовища: {avg}", background=t["surface"]).pack(side="left", padx=10)
+
+    def _build_forecast(self):
+        frame = ttk.Frame(self.content)
+        self.pages["forecast"] = frame
+
+        ctrl = ttk.Frame(frame)
+        ctrl.pack(fill="x", pady=8)
+        
+        ttk.Label(ctrl, text="Датчик: ").pack(side="left")
+        self._fc_sensor_var = tk.StringVar()
+        names = [s["name"] for s in self.sensors if s["unit"] != ""]
+        self._fc_cb = ttk.Combobox(ctrl, textvariable=self._fc_sensor_var, values=names, width=15, state="readonly")
+        self._fc_cb.current(0)
+        self._fc_cb.pack(side="left", padx=4)
+
+        ttk.Label(ctrl, text=" Період: ").pack(side="left", padx=5)
+        self._fc_horizon_var = tk.StringVar(value="6")
+        ttk.Combobox(ctrl, textvariable=self._fc_horizon_var, values=["3","6","12","24"], width=5, state="readonly").pack(side="left")
+
+        ttk.Label(ctrl, text=" Алгоритм: ").pack(side="left", padx=5)
+        self._fc_method_var = tk.StringVar(value="ma")
+        ttk.Combobox(ctrl, textvariable=self._fc_method_var, values=["linear","ma","exp","holt"], width=8, state="readonly").pack(side="left")
+
+        ttk.Button(ctrl, text="▶ Розрахувати математичний прогноз", command=self._render_forecast).pack(side="left", padx=15)
+
+        fig_frame = ttk.LabelFrame(frame, text=" Математична екстраполяція показників ")
+        fig_frame.pack(fill="both", expand=True, pady=4)
+        self._fc_fig = Figure(figsize=(8, 3), dpi=95)
+        self._fc_ax  = self._fc_fig.add_subplot(111)
+        self._fc_canvas = FigureCanvasTkAgg(self._fc_fig, fig_frame)
+        self._fc_canvas.get_tk_widget().pack(fill="both", expand=True, padx=5, pady=5)
+
+        self._fc_table_frame = ttk.LabelFrame(frame, text=" Очікувані майбутні значення ")
+        self._fc_table_frame.pack(fill="x", pady=6)
+
+    def _render_forecast(self):
+        t = self.theme
+        sel = self._fc_sensor_var.get()
+        s = next((x for x in self.sensors if x["name"] == sel), self.sensors[0])
+        horizon = int(self._fc_horizon_var.get())
+        method  = self._fc_method_var.get()
+
+        hist = s["series"] 
+        def forecast_linear(data, n):
+            x = np.arange(len(data))
+            m, b = np.polyfit(x, data, 1)
+            return [round(m*(len(data)+i)+b, 2) for i in range(n)]
+        def forecast_ma(data, n, w=5):
+            last = np.mean(data[-w:])
+            return [round(last + (np.random.randn()*0.15), 2) for _ in range(n)]
+        def forecast_exp(data, n, a=0.3):
+            v = data[-1]
+            out = []
+            for _ in range(n):
+                v = a*data[-1] + (1-a)*v
+                out.append(round(v, 2))
+            return out
+        def forecast_holt(data, n, a=0.3, b=0.1):
+            l, tr = data[-1], data[-1]-data[-2] if len(data)>1 else 0
+            out = []
+            for _ in range(n):
+                l2 = a*data[-1] + (1-a)*(l+tr)
+                tr = b*(l2-l) + (1-b)*tr
+                l = l2
+                out.append(round(l+tr, 2))
+            return out
+
+        fc_map = {"linear": forecast_linear, "ma": forecast_ma, "exp": forecast_exp, "holt": forecast_holt}
+        predicted = fc_map[method](hist, horizon)
+
+        ax = self._fc_ax
+        ax.clear()
+        ax.plot(list(range(len(hist))), hist, color=s["color"], linewidth=2, label="Реальні дані (Факт)")
+        ax.plot(list(range(len(hist), len(hist)+horizon)), predicted, color="#7f77dd", linewidth=2, linestyle="--", marker="o", label="Прогнозований тренд")
+        ax.set_facecolor(t["chart_bg"])
+        self._fc_fig.patch.set_facecolor(t["chart_bg"])
+        ax.tick_params(colors=t["text2"], labelsize=8)
+        for sp in ax.spines.values(): sp.set_edgecolor(t["border"])
+        ax.legend(fontsize=8, facecolor=t["chart_bg"], labelcolor=t["text2"])
+        self._fc_canvas.draw()
+
+        for w in self._fc_table_frame.winfo_children(): w.destroy()
+        for i, v in enumerate(predicted):
+            stc = status_color(v, s, t)
+            row = tk.Frame(self._fc_table_frame, bg=t["surface"])
+            row.pack(fill="x", pady=2, padx=10)
+            
+            tk.Label(row, text=f"через {i+1} год. ➔", font=("Courier New", 9), fg=t["text2"], bg=t["surface"]).pack(side="left")
+            tk.Label(row, text=f"{v} {s['unit']}", font=("Courier New", 9, "bold"), fg=t["text"], bg=t["surface"]).pack(side="left", padx=15)
+            tk.Label(row, text=sensor_status(v,s).upper(), font=("Courier New", 8, "bold"), fg=stc, bg=t["surface"]).pack(side="right")
+
+    def _build_automation(self):
+        frame = ttk.Frame(self.content)
+        self.pages["automation"] = frame
+
+        add_frame = ttk.LabelFrame(frame, text=" Конструктор правил автоматизації ")
+        add_frame.pack(fill="x", pady=6)
+
+        row1 = ttk.Frame(add_frame, padding=5)
+        row1.pack(fill="x")
+        
+        ttk.Label(row1, text="Якщо: ").pack(side="left")
+        self._rule_sensor_var = tk.StringVar()
+        names = [s["name"] for s in self.sensors]
+        ttk.Combobox(row1, textvariable=self._rule_sensor_var, values=names, width=14, state="readonly").pack(side="left", padx=2)
+        
+        self._rule_op_var = tk.StringVar(value=">")
+        ttk.Combobox(row1, textvariable=self._rule_op_var, values=[">","<","="], width=3, state="readonly").pack(side="left", padx=2)
+        
+        self._rule_val_entry = ttk.Entry(row1, width=7)
+        self._rule_val_entry.pack(side="left", padx=2)
+        
+        ttk.Label(row1, text=" Виконати: ").pack(side="left", padx=5)
+        self._rule_action_var = tk.StringVar(value="notify")
+        ttk.Combobox(row1, textvariable=self._rule_action_var, values=["notify","log","alarm","email"], width=8, state="readonly").pack(side="left", padx=2)
+        
+        self._rule_msg_entry = ttk.Entry(row1, width=25)
+        self._rule_msg_entry.insert(0, "Тривога! Перевищено ліміт")
+        self._rule_msg_entry.pack(side="left", padx=4)
+        
+        ttk.Button(row1, text="Створити правило", command=self._add_rule).pack(side="left", padx=10)
+
+        self._rules_list_frame = ttk.LabelFrame(frame, text=" Затверджені сценарії ")
+        self._rules_list_frame.pack(fill="x", pady=6)
+
+        self._rule_log_frame = ttk.LabelFrame(frame, text=" Лог виконання тригерів автоматизації ")
+        self._rule_log_frame.pack(fill="both", expand=True, pady=4)
+
+        cols = ("Час","Правило","Значення","Результат дії")
+        self._rule_tree = ttk.Treeview(self._rule_log_frame, columns=cols, show="headings")
+        for c in cols:
+            self._rule_tree.heading(c, text=c)
+            self._rule_tree.column(c, width=140)
+        self._rule_tree.pack(fill="both", expand=True, padx=5, pady=5)
+        self._render_rules()
+
+    def _add_rule(self):
+        sensor = self._rule_sensor_var.get()
+        op     = self._rule_op_var.get()
+        msg    = self._rule_msg_entry.get()
+        action = self._rule_action_var.get()
+        if not sensor: return
+        try:
+            val = float(self._rule_val_entry.get())
+        except ValueError:
+            messagebox.showerror("Помилка", "Значення критерію повинно бути числом")
+            return
+        self.rules.append(dict(sensor=sensor, op=op, val=val, action=action, msg=msg, enabled=True))
+        self._render_rules()
+
+    def _render_rules(self):
+        t = self.theme
+        for w in self._rules_list_frame.winfo_children(): w.destroy()
+        if not self.rules:
+            ttk.Label(self._rules_list_frame, text="Немає активованих користувацьких правил", font=("Courier New", 9, "italic")).pack(pady=5, padx=10)
+        for i, r in enumerate(self.rules):
+            row = tk.Frame(self._rules_list_frame, bg=t["surface"])
+            row.pack(fill="x", pady=2, padx=5)
+            txt = f"⚙ ЯКЩО [{r['sensor']}] {r['op']} {r['val']} ➔ ВИКЛИКАТИ [{r['action'].upper()}]: \"{r['msg']}\""
+            tk.Label(row, text=txt, font=("Courier New", 9, "bold"), fg=t["info"], bg=t["surface"]).pack(side="left", padx=5, pady=4)
+            ttk.Button(row, text="Видалити", command=lambda idx=i: self._del_rule(idx)).pack(side="right", padx=5)
+
+    def _del_rule(self, idx):
+        self.rules.pop(idx)
+        self._render_rules()
+
+    def _check_rules(self):
+        for r in self.rules:
+            s = next((x for x in self.sensors if x["name"] == r["sensor"]), None)
+            if not s: continue
+            v = s["current"]
+            triggered = (r["op"] == ">" and v > r["val"]) or \
+                        (r["op"] == "<" and v < r["val"]) or \
+                        (r["op"] == "=" and abs(v - r["val"]) < 0.1)
+            if triggered:
+                self.rule_log.insert(0, dict(
+                    time=datetime.now().strftime("%H:%M:%S"),
+                    rule=f"{r['sensor']} {r['op']} {r['val']}",
+                    value=f"{v} {s['unit']}",
+                    action=f"{r['action']}: {r['msg']}"
+                ))
+                if r["action"] == "alarm": self.root.bell()
+
+        if hasattr(self, "_rule_tree") and self._rule_tree.winfo_exists():
+            for row in self._rule_tree.get_children(): self._rule_tree.delete(row)
+            for row in self.rule_log[:40]:
+                self._rule_tree.insert("", "end", values=(row["time"], row["rule"], row["value"], row["action"]))
+
+    def _build_thresholds(self):
+        frame = ttk.Frame(self.content)
+        self.pages["thresholds"] = frame
+
+        top = ttk.Frame(frame)
+        top.pack(fill="x", pady=6)
+        ttk.Label(top, text="Налаштування апаратних лімітів безпеки", style="Header.TLabel").pack(side="left")
+        ttk.Button(top, text=" Зберегти нові конфігурації", command=self._save_thresholds).pack(side="right")
+
+        canvas = tk.Canvas(frame, bg=self.theme["bg"], highlightthickness=0)
+        scrollbar = ttk.Scrollbar(frame, orient="vertical", command=canvas.yview)
+        self._thresh_inner = ttk.Frame(canvas)
+        self._thresh_inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0,0), window=self._thresh_inner, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True, pady=5)
+        scrollbar.pack(side="right", fill="y")
+
+        self._thresh_entries = {}
+        for i, s in enumerate(self.sensors):
+            card = ttk.LabelFrame(self._thresh_inner, text=f" {s['name']} ({s['unit']}) ")
+            card.grid(row=i//4, column=i%4, padx=6, pady=6, sticky="nw")
+            
+            entries = {}
+            for field, label in [("warn","Увага (!):"),("err","Критично (!!):")]:
+                r = ttk.Frame(card, padding=2)
+                r.pack(fill="x")
+                ttk.Label(r, text=label, width=14, anchor="w").pack(side="left")
+                e = ttk.Entry(r, width=8)
+                e.insert(0, str(s[field]))
+                e.pack(side="left", padx=2)
+                entries[field] = e
+            self._thresh_entries[s["name"]] = entries
+
+    def _save_thresholds(self):
+        for s in self.sensors:
+            ent = self._thresh_entries.get(s["name"], {})
+            for field in ("warn","err"):
+                try: s[field] = float(ent[field].get())
+                except Exception: pass
+        messagebox.showinfo("Система", "Апаратні критерії безпеки успішно перезаписано.")
+        self._add_access_log("Пороги", "Зміна конфігурації системних тригерів")
+
+    def _build_export(self):
+        frame = ttk.Frame(self.content)
+        self.pages["export"] = frame
+
+        top = ttk.Frame(frame)
+        top.pack(fill="x", pady=6)
+        ttk.Label(top, text="Сховище телеметрії", style="Header.TLabel").pack(side="left")
+        
+        ttk.Button(top, text=" Очистити кеш", command=self._clear_log).pack(side="right", padx=3)
+        ttk.Button(top, text=" Експорт у JSON", command=self._export_json).pack(side="right", padx=3)
+        ttk.Button(top, text=" Експорт у CSV", command=self._export_csv).pack(side="right", padx=3)
+
+        log_frame = ttk.LabelFrame(frame, text=" Історичний реєстр звітів датчиків ")
+        log_frame.pack(fill="both", expand=True, pady=4)
+
+        cols = ("Мітка часу","Назва сенсора","Зона контролю","Значення","Одиниця","Стан")
+        self._log_tree = ttk.Treeview(log_frame, columns=cols, show="headings")
+        for c in cols:
+            self._log_tree.heading(c, text=c)
+            self._log_tree.column(c, width=120)
+        vsb = ttk.Scrollbar(log_frame, orient="vertical", command=self._log_tree.yview)
+        self._log_tree.configure(yscrollcommand=vsb.set)
+        self._log_tree.pack(side="left", fill="both", expand=True, padx=4, pady=4)
+        vsb.pack(side="right", fill="y")
+
+    def _render_export(self):
+        if hasattr(self, "_log_tree") and self._log_tree.winfo_exists():
+            for row in self._log_tree.get_children(): self._log_tree.delete(row)
+            for r in self.data_log[:250]:
+                self._log_tree.insert("", "end", values=(r["time"], r["name"], r["location"], r["value"], r["unit"], r["status"]))
+
+    def _export_csv(self):
+        path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV","*.csv")])
+        if not path: return
+        with open(path, "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.writer(f)
+            w.writerow(["Час","Датчик","Місце","Значення","Одиниця","Статус"])
+            for r in self.data_log: w.writerow([r["time"],r["name"],r["location"],r["value"],r["unit"],r["status"]])
+        messagebox.showinfo("Експорт", "Дані збережено.")
+
+    def _export_json(self):
+        path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON","*.json")])
+        if not path: return
+        with open(path, "w", encoding="utf-8") as f: json.dump(self.data_log, f, ensure_ascii=False, indent=2)
+        messagebox.showinfo("Експорт", "Дані збережено.")
+
+    def _clear_log(self):
+        self.data_log = []
+        self._render_export()
+
+    def _build_access_log(self):
+        frame = ttk.Frame(self.content)
+        self.pages["access_log"] = frame
+
+        self._session_frame = ttk.LabelFrame(frame, text=" Поточний стан авторизованої сесії ")
+        self._session_frame.pack(fill="x", pady=6)
+
+        log_frame = ttk.LabelFrame(frame, text=" Аудит дій користувачів та безпеки системи ")
+        log_frame.pack(fill="both", expand=True, pady=4)
+
+        cols = ("Час операції","Обліковий запис","Роль доступу","Тип події","Опис операції")
+        self._alog_tree = ttk.Treeview(log_frame, columns=cols, show="headings")
+        for c in cols:
+            self._alog_tree.heading(c, text=c)
+            self._alog_tree.column(c, width=130)
+        vsb = ttk.Scrollbar(log_frame, orient="vertical", command=self._alog_tree.yview)
+        self._alog_tree.configure(yscrollcommand=vsb.set)
+        self._alog_tree.pack(side="left", fill="both", expand=True, padx=4, pady=4)
+        vsb.pack(side="right", fill="y")
+
+    def _render_access_log(self):
+        t = self.theme
+        for w in self._session_frame.winfo_children(): w.destroy()
+        if self.current_user and self.session_start:
+            dur = int((datetime.now() - self.session_start).total_seconds() // 60)
+            info = f"  Активний користувач: {self.current_user['username']} | Рівень: {self.current_user['label']} | Час у системі: {dur} хв."
+            tk.Label(self._session_frame, text=info, font=("Courier New",
