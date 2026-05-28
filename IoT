@@ -1,0 +1,453 @@
+"""
+IoT Sensor Network Monitor — Simplified & Automated
+===================================================
+Автоматизована обробка та аналіз даних від датчиків у мережах IoT.
+Запуск: python iot_monitor.py
+"""
+
+import time
+import random
+import json
+import csv
+import os
+import math
+from datetime import datetime, timedelta
+from collections import deque
+
+# ─────────────────────────────────── ЗАЛЕЖНОСТІ
+try:
+    import matplotlib.pyplot as plt
+    MATPLOTLIB_OK = True
+except ImportError:
+    MATPLOTLIB_OK = False
+
+try:
+    from rich.console import Console
+    from rich.table import Table
+    from rich.panel import Panel
+    from rich.layout import Layout
+    from rich.live import Live
+    from rich import box
+    RICH_OK = True
+except ImportError:
+    RICH_OK = False
+
+console = Console() if RICH_OK else None
+
+# ═══════════════════════════════════════════════════════════════════
+#  КОНФІГУРАЦІЯ
+# ═══════════════════════════════════════════════════════════════════
+
+SENSOR_CONFIGS = [
+    {"id": "temp_a",  "name": "Температура",   "location": "Сервер A",  "room": "Серверна", "unit": "°C",  "min": 18,  "max": 85,   "warn": 65,  "crit": 75},
+    {"id": "hum_b",   "name": "Вологість",      "location": "Склад B",   "room": "Склад",    "unit": "%",   "min": 20,  "max": 95,   "warn": 75,  "crit": 85},
+    {"id": "co2_c",   "name": "Рівень CO2",     "location": "Офіс C",    "room": "Офіс",     "unit": "ppm", "min": 400, "max": 2000, "warn": 1000, "crit": 1400},
+    {"id": "pres_d",  "name": "Атмосф. тиск",   "location": "Цех D",     "room": "Цех",      "unit": "hPa", "min": 950, "max": 1050, "warn": 1015, "crit": 1025},
+    {"id": "lux_c",   "name": "Освітленість",   "location": "Офіс C",    "room": "Офіс",     "unit": "lx",  "min": 0,   "max": 1000, "warn": 700,  "crit": 850},
+    {"id": "smoke_b", "name": "Задимленість",   "location": "Склад B",   "room": "Склад",    "unit": "%",   "min": 0,   "max": 100,  "warn": 15,   "crit": 30}
+]
+
+MAX_HISTORY = 50
+
+# ═══════════════════════════════════════════════════════════════════
+#  МАТЕМАТИЧНА АНАЛІТИКА
+# ═══════════════════════════════════════════════════════════════════
+
+class Analytics:
+    @staticmethod
+    def linear_regression(y_data):
+        """Обчислення лінійного тренду (коефіцієнт нахилу)"""
+        n = len(y_data)
+        if n < 2:
+            return 0.0
+        x = list(range(n))
+        sum_x = sum(x)
+        sum_y = sum(y_data)
+        sum_xx = sum(i*i for i in x)
+        sum_xy = sum(x[i] * y_data[i] for i in range(n))
+        
+        denominator = (n * sum_xx - sum_x * sum_x)
+        if denominator == 0:
+            return 0.0
+        slope = (n * sum_xy - sum_x * sum_y) / denominator
+        return slope
+
+    @staticmethod
+    def holt_smoothing(data, alpha=0.3, beta=0.1):
+        """Експоненціальне згладжування Хольта для аналізу тенденцій"""
+        if not data:
+            return []
+        result = [data[0]]
+        level = data[0]
+        trend = data[1] - data[0] if len(data) > 1 else 0
+        
+        for i in range(1, len(data)):
+            val = data[i]
+            last_level, level = level, alpha * val + (1 - alpha) * (level + trend)
+            trend = beta * (level - last_level) + (1 - beta) * trend
+            result.append(level + trend)
+        return result
+
+    @classmethod
+    def forecast(cls, data, steps=3, alpha=0.3, beta=0.1):
+        """Прогнозування значень часового ряду на кілька кроків наперед"""
+        if len(data) < 2:
+            return [data[-1]] * steps if data else [0.0] * steps
+        
+        level = data[0]
+        trend = data[1] - data[0]
+        
+        for i in range(1, len(data)):
+            val = data[i]
+            last_level, level = level, alpha * val + (1 - alpha) * (level + trend)
+            trend = beta * (level - last_level) + (1 - beta) * trend
+            
+        return [level + (k * trend) for k in range(1, steps + 1)]
+
+    @classmethod
+    def trend_analysis(cls, history):
+        """Повертає текстовий та графічний індикатор тренду"""
+        if len(history) < 5:
+            return "Стабільний ─", 0.0
+        recent = list(history)[-10:]
+        slope = cls.linear_regression(recent)
+        
+        if slope > 0.05:
+            return "Зростає ▲", slope
+        elif slope < -0.05:
+            return "Спадає ▼", slope
+        else:
+            return "Стабільний ─", slope
+
+# ═══════════════════════════════════════════════════════════════════
+#  КОМПОНЕНТИ СИСТЕМИ (ОПП)
+# ═══════════════════════════════════════════════════════════════════
+
+class Sensor:
+    def __init__(self, config):
+        self.id = config["id"]
+        self.name = config["name"]
+        self.location = config["location"]
+        self.room = config["room"]
+        self.unit = config["unit"]
+        self.min_val = config["min"]
+        self.max_val = config["max"]
+        self.warn_threshold = config["warn"]
+        self.crit_threshold = config["crit"]
+        
+        self.current_value = (self.min_val + self.max_val) / 2
+        self.history = deque(maxlen=MAX_HISTORY)
+        self.timestamps = deque(maxlen=MAX_HISTORY)
+        
+        # Початковий розігрів історії (20 точок) для стабільної аналітики
+        base_time = datetime.now() - timedelta(minutes=40)
+        for i in range(20):
+            self.simulate_reading()
+            self.timestamps.append(base_time + timedelta(minutes=i*2))
+
+    def simulate_reading(self):
+        """Генерація значень з випадковими флуктуаціями та аномаліями"""
+        # Малі випадкові коливання
+        change = random.uniform(-2, 2) if self.id != "co2_c" else random.uniform(-30, 30)
+        self.current_value += change
+        
+        # Симуляція випадкових аномалій (8% ймовірність)
+        if random.random() < 0.08:
+            anomaly_direction = 1 if random.random() > 0.3 else -1
+            anomaly_spike = (self.max_val - self.min_val) * 0.25 * anomaly_direction
+            self.current_value += anomaly_spike
+
+        # Контроль фізичних меж датчика
+        self.current_value = max(self.min_val, min(self.max_val, self.current_value))
+        self.history.append(self.current_value)
+        self.timestamps.append(datetime.now())
+
+    @property
+    def status(self):
+        if self.current_value >= self.crit_threshold:
+            return "Критично"
+        elif self.current_value >= self.warn_threshold:
+            return "Увага"
+        return "Норма"
+
+    @property
+    def formatted_value(self):
+        return f"{self.current_value:.1f} {self.unit}"
+
+
+class AutomationRule:
+    def __init__(self, sensor_id, condition_type, threshold, action_name):
+        self.sensor_id = sensor_id
+        self.condition_type = condition_type  # 'gt' (більше) або 'lt' (менше)
+        self.threshold = threshold
+        self.action_name = action_name
+
+    def check(self, value):
+        if self.condition_type == "gt" and value >= self.threshold:
+            return True
+        if self.condition_type == "lt" and value <= self.threshold:
+            return True
+        return False
+
+
+class IoTManager:
+    def __init__(self):
+        self.sensors = [Sensor(cfg) for cfg in SENSOR_CONFIGS]
+        self.rules = [
+            AutomationRule("temp_a", "gt", 75, "Ввімкнути резервне охолодження сервера!"),
+            AutomationRule("smoke_b", "gt", 30, "Пожежна тривога на складі! Активація витяжки."),
+            AutomationRule("co2_c", "gt", 1400, "Перевищено рівень CO2. Ввімкнути примусову вентиляцію офісу.")
+        ]
+        self.event_log = []
+        self._last_notified = {}
+        self.csv_filename = "iot_data_log.csv"
+        self.json_filename = "iot_data_log.json"
+        
+        # Створення заголовків CSV файлу, якщо він новий
+        if not os.path.exists(self.csv_filename):
+            try:
+                with open(self.csv_filename, 'w', newline='', encoding='utf-8') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(["Час", "ID Датчика", "Назва", "Значення", "Статус", "Тренд"])
+            except Exception:
+                pass
+
+    def update_all(self):
+        """Оновлення станів усіх датчиків, перевірка правил та запис у CSV"""
+        for sensor in self.sensors:
+            sensor.simulate_reading()
+            trend_text, _ = Analytics.trend_analysis(sensor.history)
+            
+            # Запис у CSV файл
+            try:
+                with open(self.csv_filename, 'a', newline='', encoding='utf-8') as f:
+                    writer = csv.writer(f)
+                    writer.writerow([
+                        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        sensor.id, sensor.name, round(sensor.current_value, 2),
+                        sensor.status, trend_text
+                    ])
+            except Exception:
+                pass
+
+        self._check_rules()
+
+    def _check_rules(self):
+        """Внутрішня перевірка правил автоматизації"""
+        for rule in self.rules:
+            sensor = next((s for s in self.sensors if s.id == rule.sensor_id), None)
+            if sensor and rule.check(sensor.current_value):
+                # Блокування дублювання однакових сповіщень поспіль
+                if self._last_notified.get(rule.sensor_id) != rule.action_name:
+                    timestamp = datetime.now().strftime("%H:%M:%S")
+                    msg = f"[{timestamp}] [АВТОМАТИКА] {sensor.name} ({sensor.formatted_value}) -> {rule.action_name}"
+                    self.event_log.append(msg)
+                    self._last_notified[rule.sensor_id] = rule.action_name
+            else:
+                if sensor and self._last_notified.get(rule.sensor_id) == rule.action_name:
+                    # Скидання блокування, якщо стан повернувся до норми
+                    timestamp = datetime.now().strftime("%H:%M:%S")
+                    self.event_log.append(f"[{timestamp}] [СИСТЕМА] {sensor.name} нормалізувався.")
+                    self._last_notified[rule.sensor_id] = None
+
+    def save_json_report(self):
+        """Експорт фінального звіту у JSON формат"""
+        report = {
+            "metadata": {
+                "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "total_sensors": len(self.sensors)
+            },
+            "snapshots": []
+        }
+        for s in self.sensors:
+            trend, _ = Analytics.trend_analysis(s.history)
+            forecast_vals = Analytics.forecast(list(s.history), steps=3)
+            report["snapshots"].append({
+                "id": s.id,
+                "name": s.name,
+                "location": f"{s.location} ({s.room})",
+                "last_value": round(s.current_value, 2),
+                "unit": s.unit,
+                "status": s.status,
+                "current_trend": trend,
+                "short_forecast_3h": [round(v, 2) for v in forecast_vals]
+            })
+        
+        try:
+            with open(self.json_filename, 'w', encoding='utf-8') as f:
+                json.dump(report, f, indent=4, ensure_ascii=False)
+        except Exception as e:
+            print(f"Помилка експорту JSON: {e}")
+
+# ═══════════════════════════════════════════════════════════════════
+#  ІНТЕРФЕЙС ТА ВІЗУАЛІЗАЦІЯ
+# ═══════════════════════════════════════════════════════════════════
+
+def build_sensor_table(manager: IoTManager) -> Table:
+    """Генерація інтерактивної таблиці за допомогою Rich"""
+    table = Table(title="📊 Моніторинг IoT Sensor Network (В режимі Live)", box=box.ROUNDED, expand=True)
+    table.add_column("ID", justify="center", style="cyan")
+    table.add_column("Метрика / Датчик", style="bold white")
+    table.add_column("Локація", style="italic list")
+    table.add_column("Поточне значення", justify="right")
+    table.add_column("Статус", justify="center")
+    table.add_column("Математичний Тренд", justify="center")
+    table.add_column("Прогноз (через 3 год)", justify="right", style="magenta")
+
+    for s in manager.sensors:
+        status_str = s.status
+        if status_str == "Критично":
+            status_formatted = "[bold red]Критично[/bold red]"
+        elif status_str == "Увага":
+            status_formatted = "[bold yellow]Увага[/bold yellow]"
+        else:
+            status_formatted = "[bold green]Норма[/bold green]"
+
+        trend_text, _ = Analytics.trend_analysis(s.history)
+        if "▲" in trend_text:
+            trend_formatted = f"[red]{trend_text}[/red]"
+        elif "▼" in trend_text:
+            trend_formatted = f"[green]{trend_text}[/green]"
+        else:
+            trend_formatted = f"[gray]{trend_text}[/gray]"
+
+        forecast_3h = Analytics.forecast(list(s.history), steps=3)[-1]
+        forecast_str = f"{forecast_3h:.1f} {s.unit}"
+
+        table.add_row(s.id, s.name, f"{s.location} - {s.room}", s.formatted_value, status_formatted, trend_formatted, forecast_str)
+    
+    return table
+
+
+def build_sensor_table(manager: IoTManager) -> Table:
+    """Генерація інтерактивної таблиці за допомогою Rich"""
+    table = Table(title="📊 Моніторинг IoT Sensor Network (В режимі Live)", box=box.ROUNDED, expand=True)
+    table.add_column("ID", justify="center", style="cyan")
+    table.add_column("Метрика / Датчик", style="bold white")
+    table.add_column("Локація", style="italic light_salmon3")  # <-- ТУТ ВИПРАВЛЕНО (змінено 'italic list' на правильний колір)
+    table.add_column("Поточне значення", justify="right")
+    table.add_column("Статус", justify="center")
+    table.add_column("Математичний Тренд", justify="center")
+    table.add_column("Прогноз (через 3 год)", justify="right", style="magenta")
+
+    for s in manager.sensors:
+        status_str = s.status
+        if status_str == "Критично":
+            status_formatted = "[bold red]Критично[/bold red]"
+        elif status_str == "Увага":
+            status_formatted = "[bold yellow]Увага[/bold yellow]"
+        else:
+            status_formatted = "[bold green]Норма[/bold green]"
+
+        trend_text, _ = Analytics.trend_analysis(s.history)
+        if "▲" in trend_text:
+            trend_formatted = f"[red]{trend_text}[/red]"
+        elif "▼" in trend_text:
+            trend_formatted = f"[green]{trend_text}[/green]"
+        else:
+            trend_formatted = f"[gray]{trend_text}[/gray]"
+
+        forecast_3h = Analytics.forecast(list(s.history), steps=3)[-1]
+        forecast_str = f"{forecast_3h:.1f} {s.unit}"
+
+        table.add_row(s.id, s.name, f"{s.location} - {s.room}", s.formatted_value, status_formatted, trend_formatted, forecast_str)
+    
+    return table
+
+def build_events_panel(manager: IoTManager) -> Panel:
+    """Генерація панелі журналу подій"""
+    recent_events = manager.event_log[-6:] if manager.event_log else ["Подій автоматизації немає. Система працює стабільно."]
+    content = "\n".join(recent_events)
+    return Panel(content, title="🔔 Журнал автоматичних подій безпеки", border_style="yellow", expand=True)
+
+def plot_charts(manager: IoTManager):
+    """Побудова графіків за допомогою Matplotlib"""
+    if not MATPLOTLIB_OK:
+        print("\n[!] Matplotlib не знайдено. Графічна візуалізація пропущена.")
+        return
+
+    print("\nГенерація фінальних аналітичних звітів та графіків...")
+    
+    # Скріншот 1: Історія та Прогноз для першого датчика (Температура)
+    s = manager.sensors[0]
+    history_list = list(s.history)
+    forecast_list = Analytics.forecast(history_list, steps=5)
+    
+    plt.figure(figsize=(10, 5))
+    plt.plot(range(len(history_list)), history_list, label="Історичні дані", color="blue", marker="o")
+    
+    # Лінія прогнозу
+    forecast_idx = range(len(history_list), len(history_list) + len(forecast_list))
+    plt.plot(forecast_idx, forecast_list, label="Прогноз (Метод Хольта)", color="magenta", linestyle="--", marker="x")
+    
+    plt.axhline(y=s.crit_threshold, color='red', linestyle='-', label=f'Критичний поріг ({s.crit_threshold}{s.unit})')
+    plt.title(f"Аналітика часового ряду: {s.name} ({s.location})")
+    plt.xlabel("Таймфрейми (Виміри)")
+    plt.ylabel(s.unit)
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+    # Скріншот 2: Порівняльна гістограма статусів датчиків
+    names = [sensor.name for sensor in manager.sensors]
+    current_values = [sensor.current_value for sensor in manager.sensors]
+    
+    plt.figure(figsize=(10, 5))
+    bars = plt.bar(names, current_values, color=['orange' if sn.status == "Увага" else 'red' if sn.status == "Критично" else 'green' for sn in manager.sensors])
+    plt.title("Порівняльна гістограма поточних рівнів датчиків")
+    plt.ylabel("Значення вимірів")
+    plt.xticks(rotation=15)
+    plt.grid(axis='y', linestyle='--', alpha=0.7)
+    
+    # Додавання текстових підписів над стовпчиками
+    for bar, sensor in zip(bars, manager.sensors):
+        height = bar.get_height()
+        plt.text(bar.get_x() + bar.get_width()/2.0, height, f"{height:.1f} {sensor.unit}", ha='center', va='bottom', fontsize=9, fontweight='bold')
+        
+    plt.show()
+
+# ═══════════════════════════════════════════════════════════════════
+#  ГОЛОВНА ФУНКЦІЯ
+# ═══════════════════════════════════════════════════════════════════
+
+def main():
+    manager = IoTManager()
+    iterations = 15  # Кількість автоматичних кроків моніторингу
+    
+    print("Ініціалізація системи автоматичного моніторингу IoT...")
+    time.sleep(1)
+
+    if RICH_OK:
+        try:
+            with Live(console=console, refresh_per_second=1) as live:
+                for _ in range(iterations):
+                    manager.update_all()
+                    
+                    layout = Layout()
+                    layout.split_column(
+                        Layout(build_sensor_table(manager), name="table", ratio=3),
+                        Layout(build_events_panel(manager), name="events", ratio=1)
+                    )
+                    live.update(layout)
+                    time.sleep(2)
+        except KeyboardInterrupt:
+            pass
+    else:
+        # Спрощений консольний текст, якщо Rich відсутній
+        for i in range(iterations):
+            manager.update_all()
+            print(f"\n--- Крок моніторингу {i+1}/{iterations} ({datetime.now().strftime('%H:%M:%S')}) ---")
+            for s in manager.sensors:
+                print(f"Датчик: {s.name:15} | Значення: {s.formatted_value:10} | Статус: {s.status}")
+            time.sleep(2)
+
+    # Експорт фінальних звітів та запуск візуалізації
+    manager.save_json_report()
+    print(f"\n[+] Дані успішно залоговано в '{manager.csv_filename}'")
+    print(f"[+] Фінальний аналітичний звіт збережено в '{manager.json_filename}'")
+    
+    plot_charts(manager)
+    print("Роботу системи моніторингу завершено успішно.")
+
+if __name__ == "__main__":
+    main()
